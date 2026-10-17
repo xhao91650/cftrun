@@ -58,13 +58,66 @@ const randomTID = () => crypto.getRandomValues(new Uint8Array(12));
 const isIPv4 = h => /^\d{1,3}(\.\d{1,3}){3}$/.test(h);
 const stripBrackets = h => h.replace(/^\[|\]$/g, '');
 
+// 纯 JS MD5 (Cloudflare Workers 不支持 crypto.subtle.digest('MD5'))
+function md5Bytes(input) {
+  const state = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+  const K = new Uint32Array([0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391]);
+  const S = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+  const add32 = (a, b) => (a + b) & 0xffffffff;
+  const rotl = (x, n) => (x << n) | (x >>> (32 - n));
+  const bitLen = input.length * 8;
+  const paddedLen = ((input.length + 9) >> 6 << 6) + 64;
+  const padded = new Uint8Array(paddedLen);
+  padded.set(input);
+  padded[input.length] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(paddedLen - 8, bitLen >>> 0, true);
+  dv.setUint32(paddedLen - 4, Math.floor(bitLen / 4294967296), true);
+  for (let off = 0; off < paddedLen; off += 64) {
+    const w = new Uint32Array(16);
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4, true);
+    let [a, b, c, d] = state;
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+      const tmp = d; d = c; c = b;
+      b = add32(b, rotl(add32(add32(a, f), add32(K[i], w[g])), S[i]));
+      a = tmp;
+    }
+    state[0] = add32(state[0], a); state[1] = add32(state[1], b);
+    state[2] = add32(state[2], c); state[3] = add32(state[3], d);
+  }
+  const result = new Uint8Array(16);
+  const rv = new DataView(result.buffer);
+  for (let i = 0; i < 4; i++) rv.setUint32(i * 4, state[i], true);
+  return result;
+}
+
+// hex / base64 兼容 (Workers 不支持 Uint8Array.fromHex / fromBase64)
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  return bytes;
+}
+function base64UrlToBytes(str) {
+  let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
 async function md5(s) {
-  return new Uint8Array(await crypto.subtle.digest('MD5', enc(s)));
+  return md5Bytes(enc(s));
 }
 async function md5md5(s) {
-  const h1 = await md5(s);
-  return Array.from(new Uint8Array(await crypto.subtle.digest('MD5', h1)))
-    .map(b => b.toString(16).padStart(2, '0')).join('');
+  const h1 = md5Bytes(enc(s));
+  const h2 = md5Bytes(h1);
+  return Array.from(h2).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 async function resolveIP(host) {
   if (isIPv4(host)) return host;
@@ -80,7 +133,7 @@ async function resolveIP(host) {
 // ============================================================
 let idBytes = null;
 function setUUID(uuid) {
-  idBytes = Uint8Array.fromHex(uuid.replaceAll('-', ''));
+  idBytes = hexToBytes(uuid.replace(/-/g, ''));
 }
 function checkUUID(c) {
   return !idBytes.some((v, i) => c[i + 1] !== v);
@@ -660,7 +713,7 @@ async function handleWS(req, env, cfg) {
   };
 
   if (ed?.length <= MAX_ED) {
-    chain = chain.then(() => process(Uint8Array.fromBase64(ed, { alphabet: 'base64url' }))).catch(close);
+    chain = chain.then(() => process(base64UrlToBytes(ed))).catch(close);
   }
   server.addEventListener('message', e => {
     chain = chain.then(() => process(new Uint8Array(e.data instanceof ArrayBuffer ? e.data : e.data.buffer ?? e.data))).catch(close);
